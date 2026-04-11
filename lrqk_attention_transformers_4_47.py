@@ -3,7 +3,6 @@ import gc
 import io
 import logging
 import math
-import sys
 import time
 import warnings
 from collections import defaultdict, namedtuple
@@ -537,7 +536,7 @@ def _lrqk_decode_inv_w1(
     max_iter: int = 2,
     tol: float = 1e-3,
 ):
-    r"""
+    """
     Compute and update stated in decode mode.
 
     Args:
@@ -1796,18 +1795,8 @@ class DynamicLRQKCache(cache_utils.Cache):
         num_key_value_groups: int = 1,
         lwattn_factory=LightAttentionIndicesFactory,
         init_aq_ak_method: Union[InitAQAK, str] = InitAQAK.randn,
-        layers = None,
-        layer_class_to_replicate = None,
     ):
-        # For transformers >= 4.47+ API compatibility
-        if layers is None and layer_class_to_replicate is None:
-            # Fully custom implementation, pass empty layers
-            super().__init__(layers=[])
-            self.num_layers = 0
-        else:
-            super().__init__(layers=layers, layer_class_to_replicate=layer_class_to_replicate)
-            # Number of layers is exactly the number of layers passed
-            self.num_layers = len(layers) if layers is not None else 0
+        super().__init__()
 
         self.num_key_value_groups = num_key_value_groups
         self.r = r
@@ -1818,7 +1807,6 @@ class DynamicLRQKCache(cache_utils.Cache):
         self.max_iter = _ensure_tuple2(max_iter)
         self.tol = _ensure_tuple2(tol)
         self.lite_tokens = lite_tokens
-        self.max_sequence_length = max_sequence_length
 
         self.lwattn = defaultdict(lambda: lwattn_factory(
             num_lite_tokens=lite_tokens,
@@ -1845,7 +1833,7 @@ class DynamicLRQKCache(cache_utils.Cache):
 
     def __getitem__(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Support for backwards-compatible `past_key_values` indexing, e.g. `past_key_values[0][0].shape[2]` to get the
+        Support for backwards-compatible `past_key_value` indexing, e.g. `past_key_value[0][0].shape[2]` to get the
         sequence length.
         """
         raise NotImplementedError("DynamicLRQKCache does not support indexing")
@@ -1859,58 +1847,16 @@ class DynamicLRQKCache(cache_utils.Cache):
         return len(self.sequence_state)
 
     def get_seq_length(self, layer_idx=0):
-        # When still collecting into temp buffer (before low-rank decomposition),
-        # get the total length from accumulated tokens in temp buffer
-        if layer_idx in self.temp_buff_cache_qkv:
-            temp_buff = self.temp_buff_cache_qkv[layer_idx]
-            if len(temp_buff) > 0:
-                return len(temp_buff)
         return len(self.lwattn[layer_idx])
 
     def get_max_cache_shape(self) -> Optional[int]:
         """Returns the maximum sequence length of the cache object. DynamicCache does not have a maximum length."""
         return None
 
-    def get_max_length(self) -> Optional[int]:
-        """Returns the maximum sequence length of the cache object."""
-        return self.max_sequence_length
-
-    def get_usable_length(self, new_seq_length: int, layer_idx: int = 0) -> int:
-        """
-        Given the length of the new sequence, return the number of usable tokens in the cache.
-        """
-        return self.get_seq_length(layer_idx) + new_seq_length
-
     @property
     def seen_tokens(self):
         """This method is deprecated and will be removed. Implement for older versions of Transformers."""
-        # All layers have the same current sequence length, so just get from layer 0
-        # This automatically accounts for temp buffer or low-rank cache, no need for manual counting
-        return self.get_seq_length(0)
-
-    def to_legacy_cache(self) -> Tuple[Tuple[torch.Tensor, torch.Tensor], ...]:
-        """
-        Converts the cache to the legacy format, which is a tuple of (key, value) tuples for each layer.
-        DynamicLRQKCache does not support this operation as it stores low-rank representations instead of full KV.
-        """
-        raise NotImplementedError(
-            "DynamicLRQKCache does not support conversion to legacy cache format. "
-            "Use standard DynamicCache if you need legacy cache support."
-        )
-
-    @classmethod
-    def from_legacy_cache(
-        cls,
-        past_key_valuess: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
-        **kwargs,
-    ) -> "DynamicLRQKCache":
-        """
-        Creates a DynamicLRQKCache from a legacy cache. Not supported for this custom cache type.
-        """
-        raise NotImplementedError(
-            "DynamicLRQKCache does not support creation from legacy cache format. "
-            "Initialize a new DynamicLRQKCache instead."
-        )
+        return self.get_seq_length()
 
     def update(
         self,
@@ -1919,7 +1865,6 @@ class DynamicLRQKCache(cache_utils.Cache):
         value_states: torch.Tensor,
         layer_idx: int,
         attention_mask: Optional[torch.Tensor] = None,
-        cache_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         We will check seq_len to determine whether we are in prefill mode or not
@@ -2044,40 +1989,6 @@ class FullOffloadCache(cache_utils.Cache):
     def get_seq_length(self, layer_idx=0):
         return len(self.KVcpu[layer_idx])
 
-    def get_max_cache_shape(self) -> Optional[int]:
-        """Returns the maximum sequence length of the cache object."""
-        return None
-
-    def to_legacy_cache(self) -> Tuple[Tuple[torch.Tensor, torch.Tensor], ...]:
-        """
-        Converts the cache to the legacy format, which is a tuple of (key, value) tuples for each layer.
-        """
-        legacy_cache = []
-        for layer_idx in range(len(self)):
-            kvcpu = self.KVcpu[layer_idx]
-            kv = kvcpu.tensor()
-            hdim = kv.shape[-1] // 2
-            k = kv[..., :hdim]
-            v = kv[..., hdim:]
-            legacy_cache.append((k, v))
-        return tuple(legacy_cache)
-
-    @classmethod
-    def from_legacy_cache(
-        cls,
-        past_key_valuess: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
-        **kwargs,
-    ) -> "FullOffloadCache":
-        """
-        Creates a FullOffloadCache from a legacy cache.
-        """
-        cache = cls()
-        if past_key_valuess is not None:
-            for layer_idx, (k, v) in enumerate(past_key_valuess):
-                kv = torch.cat([k, v], dim=-1)
-                cache.KVcpu[layer_idx].append(k, v)
-        return cache
-
     def update(
         self,
         key_states: torch.Tensor,
@@ -2194,42 +2105,50 @@ class WrapForwardTimer:
         return wraper, wraper.module
 
 
-class LRQK_Qwen2FlashAttention2(modeling_qwen2.Qwen2Attention):
+class LRQK_Qwen2FlashAttention2(modeling_qwen2.Qwen2FlashAttention2):
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[cache_utils.Cache] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[cache_utils.Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # will become mandatory in v4.46
+        position_embeddings: Optional[Tuple[torch.Tensor,
+                                            torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        # Use config for compatibility with newer transformers versions (>= 4.47+)
-        num_heads = getattr(self, 'num_heads', self.config.num_attention_heads)
-        num_key_value_heads = getattr(self, 'num_key_value_heads', self.config.num_key_value_heads)
-        head_dim = getattr(self, 'head_dim', self.config.hidden_size // self.config.num_attention_heads)
-
         query_states = query_states.view(
-            bsz, q_len, num_heads, head_dim).transpose(1, 2)
+            bsz, q_len, -1, self.head_dim).transpose(1, 2)
         key_states = key_states.view(
-            bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
+            bsz, q_len, -1, self.head_dim).transpose(1, 2)
         value_states = value_states.view(
-            bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
+            bsz, q_len, -1, self.head_dim).transpose(1, 2)
 
-        cos, sin = position_embeddings
+        if position_embeddings is None:
+            modeling_qwen2.logger.warning_once(
+                "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
+                "through `position_ids` (2D tensor with the indexes of the tokens), to using externally computed "
+                "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.46 `position_ids` will be "
+                "removed and `position_embeddings` will be mandatory."
+            )
+            cos, sin = self.rotary_emb(value_states, position_ids)
+        else:
+            cos, sin = position_embeddings
         query_states, key_states = modeling_qwen2.apply_rotary_pos_emb(
             query_states, key_states, cos, sin)
 
-        # if past_key_values is not None:
+        # if past_key_value is not None:
         # cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
-        key_states, value_states = past_key_values.update(
+        key_states, value_states = past_key_value.update(
             query_states, key_states, value_states, self.layer_idx,
             attention_mask=attention_mask)
         # the update method will automatically repeat KV heads if needed
@@ -2281,43 +2200,48 @@ class LRQK_Qwen2FlashAttention2(modeling_qwen2.Qwen2Attention):
 
         # print("\033[33mq:{query_states.shape}, k:{key_states.shape}, v:{value_states.shape}, mask:{attention_mask.shape}\033[0m")
 
-        attn_output = flash_attn_with_kvcache(query_states, key_states, value_states, causal=True)
+        # attn_output = flash_attn_with_kvcache(query_states, key_states, value_states, causal=True)
 
-        # attn_output = modeling_qwen2._flash_attention_forward(
-        #     query_states,
-        #     key_states,
-        #     value_states,
-        #     attention_mask,
-        #     q_len,
-        #     position_ids=position_ids,
-        #     dropout=dropout_rate,
-        #     sliding_window=sliding_window,
-        #     is_causal=self.is_causal,
-        #     use_top_left_mask=self._flash_attn_uses_top_left_mask,
-        # )
+        attn_output = modeling_qwen2._flash_attention_forward(
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            q_len,
+            position_ids=position_ids,
+            dropout=dropout_rate,
+            sliding_window=sliding_window,
+            is_causal=self.is_causal,
+            use_top_left_mask=self._flash_attn_uses_top_left_mask,
+        )
 
-        hidden_size = getattr(self, 'hidden_size', self.config.hidden_size)
         attn_output = attn_output.reshape(
-            bsz, q_len, hidden_size).contiguous()
+            bsz, q_len, self.hidden_size).contiguous()
         attn_output = self.o_proj(attn_output)
 
-        # output_attentions is always False in 5.x
-        attn_weights = None
-        return attn_output, attn_weights
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
 
 
-class LRQK_LlamaFlashAttention2(modeling_llama.LlamaAttention):
+class LRQK_LlamaFlashAttention2(modeling_llama.LlamaFlashAttention2):
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[cache_utils.Cache] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[cache_utils.Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if isinstance(past_key_values, cache_utils.StaticCache):
+        # will become mandatory in v4.46
+        position_embeddings: Optional[Tuple[torch.Tensor,
+                                            torch.Tensor]] = None,
+        **kwargs: modeling_llama.Unpack[modeling_llama.FlashAttentionKwargs],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if isinstance(past_key_value, cache_utils.StaticCache):
             raise ValueError(
                 "`static` cache implementation is not compatible with `attn_implementation==flash_attention_2` "
                 "make sure to use `sdpa` in the mean time, and open an issue at https://github.com/huggingface/transformers"
@@ -2334,26 +2258,30 @@ class LRQK_LlamaFlashAttention2(modeling_llama.LlamaAttention):
         # Flash attention requires the input to have the shape
         # batch_size x seq_length x head_dim x hidden_dim
         # therefore we just need to keep the original shape
-        # Use config for compatibility with newer transformers versions (>= 4.47+)
-        num_heads = getattr(self, 'num_heads', self.config.num_attention_heads)
-        num_key_value_heads = getattr(self, 'num_key_value_heads', self.config.num_key_value_heads)
-        head_dim = getattr(self, 'head_dim', self.config.hidden_size // self.config.num_attention_heads)
-
         query_states = query_states.view(
-            bsz, q_len, num_heads, head_dim).transpose(1, 2)
+            bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(
-            bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
+            bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(
-            bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
+            bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        cos, sin = position_embeddings
+        if position_embeddings is None:
+            logger.warning_once(
+                "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
+                "through `position_ids` (2D tensor with the indexes of the tokens), to using externally computed "
+                "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.46 `position_ids` will be "
+                "removed and `position_embeddings` will be mandatory."
+            )
+            cos, sin = self.rotary_emb(value_states, position_ids)
+        else:
+            cos, sin = position_embeddings
         query_states, key_states = modeling_llama.apply_rotary_pos_emb(
             query_states, key_states, cos, sin)
 
-        # if past_key_values is not None:
+        # if past_key_value is not None:
         #     # sin and cos are specific to RoPE models; cache_position needed for the static cache
         #     cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-        key_states, value_states = past_key_values.update(
+        key_states, value_states = past_key_value.update(
             query_states, key_states, value_states, self.layer_idx,
             attention_mask=attention_mask)
 
@@ -2415,12 +2343,13 @@ class LRQK_LlamaFlashAttention2(modeling_llama.LlamaAttention):
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
         attn_output = self.o_proj(attn_output)
 
-        # output_attentions is always False in 5.x
-        attn_weights = None
-        return attn_output, attn_weights
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
 
 
-class LRQK_MistralFlashAttention2(modeling_mistral.MistralAttention):
+class LRQK_MistralFlashAttention2(modeling_mistral.MistralFlashAttention2):
     """
     Mistral flash attention module. This module inherits from `MistralAttention` as the weights of the module stays
     untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
@@ -2430,13 +2359,103 @@ class LRQK_MistralFlashAttention2(modeling_mistral.MistralAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[DynamicLRQKCache] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[DynamicLRQKCache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        raise NotImplementedError("Not implemented yet")
+    ):
+        if isinstance(past_key_value, cache_utils.StaticCache):
+            raise ValueError(
+                "`static` cache implementation is not compatible with `attn_implementation==flash_attention_2` "
+                "make sure to use `sdpa` in the mean time, and open an issue at https://github.com/huggingface/transformers"
+            )
+
+        output_attentions = False
+
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(
+            bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(
+            bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(
+            bsz, q_len, -1, self.head_dim).transpose(1, 2)
+
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            kv_seq_len += cache_position[0]
+
+        cos, sin = self.rotary_emb(value_states, position_ids)
+        query_states, key_states = modeling_mistral.apply_rotary_pos_emb(
+            query_states, key_states, cos, sin)
+
+        # if past_key_value is not None:
+        #     cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+        key_states, value_states = past_key_value.update(
+            query_states, key_states, value_states, self.layer_idx,
+            attention_mask=attention_mask,
+        )
+
+        # repeat k/v heads if n_kv_heads < n_heads
+        # key_states = repeat_kv(key_states, self.num_key_value_groups)
+        # value_states = repeat_kv(value_states, self.num_key_value_groups)
+        dropout_rate = 0.0 if not self.training else self.attention_dropout
+
+        # In PEFT, usually we cast the layer norms in float32 for training stability reasons
+        # therefore the input hidden states gets silently casted in float32. Hence, we need
+        # cast them back in float16 just to be sure everything works as expected.
+        input_dtype = query_states.dtype
+        if input_dtype == torch.float32:
+            if torch.is_autocast_enabled():
+                target_dtype = torch.get_autocast_gpu_dtype()
+            # Handle the case where the model is quantized
+            elif hasattr(self.config, "_pre_quantization_dtype"):
+                target_dtype = self.config._pre_quantization_dtype
+            else:
+                target_dtype = self.q_proj.weight.dtype
+
+            logger.warning_once(
+                f"The input hidden states seems to be silently casted in float32, this might be related to"
+                f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
+                f" {target_dtype}."
+            )
+
+            query_states = query_states.to(target_dtype)
+            key_states = key_states.to(target_dtype)
+            value_states = value_states.to(target_dtype)
+
+        # Reashape to the expected shape for Flash Attention
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+        attn_output = modeling_mistral._flash_attention_forward(
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            q_len,
+            position_ids=position_ids,
+            dropout=dropout_rate,
+            sliding_window=getattr(self.config, "sliding_window", None),
+            use_top_left_mask=self._flash_attn_uses_top_left_mask,
+            is_causal=self.is_causal,
+        )
+
+        attn_output = attn_output.reshape(
+            bsz, q_len, self.num_heads * self.head_dim).contiguous()
+        attn_output = self.o_proj(attn_output)
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
 
 
 class LRQK_Phi3FlashAttention2(modeling_phi3.Phi3Attention):
@@ -2444,19 +2463,133 @@ class LRQK_Phi3FlashAttention2(modeling_phi3.Phi3Attention):
     Phi-3 flash attention module. This module inherits from `Phi3Attention` as the weights of the module stays
     untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
     flash attention and deal with padding tokens in case the input contains any of them.
-    For transformers >= 5.3+: rotary computed outside attention, clean API.
     """
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[cache_utils.Cache] = None,
+        attention_mask: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[cache_utils.Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        raise NotImplementedError("Not implemented yet")
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        # Phi3FlashAttention2 attention does not support output_attentions
+
+        output_attentions = False
+
+        bsz, q_len, _ = hidden_states.size()
+
+        qkv = self.qkv_proj(hidden_states)
+        query_pos = self.num_heads * self.head_dim
+        query_states = qkv[..., :query_pos]
+        key_states = qkv[..., query_pos: query_pos +
+                         self.num_key_value_heads * self.head_dim]
+        value_states = qkv[..., query_pos +
+                           self.num_key_value_heads * self.head_dim:]
+
+        # Flash attention requires the input to have the shape
+        # batch_size x seq_length x head_dim x hidden_dim
+        # therefore we just need to keep the original shape
+        query_states = query_states.view(
+            bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            if self.layer_idx is None:
+                raise ValueError(
+                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
+                    "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
+                    "with a layer index."
+                )
+            kv_seq_len += past_key_value.get_usable_length(
+                kv_seq_len, self.layer_idx)
+
+        # Because the input can be padded, the absolute sequence length depends on the max position id.
+        rotary_seq_len = (
+            max(kv_seq_len, position_ids[:, -1].max().item() +
+                1) if position_ids is not None else kv_seq_len
+        )
+
+        cos, sin = self.rotary_emb(
+            value_states, seq_len=rotary_seq_len, position_ids=position_ids)
+
+        query_states, key_states = modeling_phi3.apply_rotary_pos_emb(
+            query_states, key_states, cos, sin, position_ids)
+
+        # if past_key_value is not None:
+        # cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
+        key_states, value_states = past_key_value.update(
+            query_states, key_states, value_states, self.layer_idx,
+            attention_mask=attention_mask
+        )
+
+        # repeat k/v heads if n_kv_heads < n_heads
+        # key_states = repeat_kv(key_states, self.num_key_value_groups)
+        # value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        attn_dropout = self.attention_dropout if self.training else 0.0
+
+        # In PEFT, usually we cast the layer norms in float32 for training stability reasons
+        # therefore the input hidden states gets silently casted in float32. Hence, we need
+        # cast them back in the correct dtype just to be sure everything works as expected.
+        # This might slowdown training & inference so it is recommended to not cast the LayerNorms
+        # in fp32.
+
+        if query_states.dtype == torch.float32:
+            if torch.is_autocast_enabled():
+                target_dtype = torch.get_autocast_gpu_dtype()
+            # Handle the case where the model is quantized
+            elif hasattr(self.config, "_pre_quantization_dtype"):
+                target_dtype = self.config._pre_quantization_dtype
+            else:
+                target_dtype = self.qkv_proj.weight.dtype
+
+            logger.warning_once(
+                f"The input hidden states seems to be silently casted in float32, this might be related to"
+                f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
+                f" {target_dtype}."
+            )
+
+            query_states = query_states.to(target_dtype)
+            key_states = key_states.to(target_dtype)
+            value_states = value_states.to(target_dtype)
+
+        # Reashape to the expected shape for Flash Attention
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+        attn_output = flash_attn_with_kvcache(
+            query_states, key_states, value_states, causal=True)
+
+        # attn_output = modeling_phi3._flash_attention_forward(
+        #     query_states,
+        #     key_states,
+        #     value_states,
+        #     attention_mask,
+        #     q_len,
+        #     position_ids=position_ids,
+        #     dropout=attn_dropout,
+        #     # sliding_window=getattr(self.config, "sliding_window", None),
+        #     sliding_window=None, # always disable sliding window
+        #     use_top_left_mask=self._flash_attn_uses_top_left_mask,
+        #     is_causal=self.is_causal,
+        # )
+
+        attn_output = attn_output.reshape(
+            bsz, q_len, self.hidden_size).contiguous()
+        attn_output = self.o_proj(attn_output)
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
 
 
 def load_model_hack(
@@ -2472,74 +2605,66 @@ def load_model_hack(
     - model_name: the model name
     - device: the device to load the model
     - yarn: the additional arguments to pass to the model
-    - base_model: the model to load;
+    - base_model: the model to load; 
         If provided, we will use this model instead of loading a new one.
     """
     mn = model_name.lower()
     model = None
     _mod_cls = None
     _flash_new = None
-    old_flash = None
     if "qwen" in mn:
-        # Qwen Model - only replace class in dict if it exists
+        # Qwen Model
+        _mod_cls = modeling_qwen2.QWEN2_ATTENTION_CLASSES
         _flash_new = LRQK_Qwen2FlashAttention2
-        if hasattr(modeling_qwen2, 'QWEN2_ATTENTION_CLASSES'):
-            _mod_cls = modeling_qwen2.QWEN2_ATTENTION_CLASSES
     elif "llama" in mn:
+        _mod_cls = modeling_llama.LLAMA_ATTENTION_CLASSES
         _flash_new = LRQK_LlamaFlashAttention2
-        if hasattr(modeling_llama, 'LLAMA_ATTENTION_CLASSES'):
-            _mod_cls = modeling_llama.LLAMA_ATTENTION_CLASSES
     elif "mistral" in mn:
+        _mod_cls = modeling_mistral.MISTRAL_ATTENTION_CLASSES
         _flash_new = LRQK_MistralFlashAttention2
-        if hasattr(modeling_mistral, 'MISTRAL_ATTENTION_CLASSES'):
-            _mod_cls = modeling_mistral.MISTRAL_ATTENTION_CLASSES
     elif "phi-3" in mn or "phi3" in mn:
+        _mod_cls = modeling_phi3.PHI3_ATTENTION_CLASSES
         _flash_new = LRQK_Phi3FlashAttention2
-        # Check if PHI3_ATTENTION_CLASSES exists (hub version has it, built-in transformers may not)
-        if hasattr(modeling_phi3, 'PHI3_ATTENTION_CLASSES'):
-            _mod_cls = modeling_phi3.PHI3_ATTENTION_CLASSES
     elif "phi" in mn:
+        _mod_cls = {"flash_attention_2": None}
         _flash_new = None
     else:
         raise ValueError(f"Unknown model name: {model_name}")
         # warnings.warn(f"Unknown model name: {model_name}. fall back to default.")
+        # _mod_cls = {"flash_attention_2": None}
         # _flash_new = None
 
-    # Replace the class in the attention dict before loading if available
-    if _mod_cls is not None and _flash_new is not None:
-        old_flash = _mod_cls["flash_attention_2"]
-        _mod_cls["flash_attention_2"] = _flash_new
+    old_flash = _mod_cls["flash_attention_2"]
+    _mod_cls["flash_attention_2"] = _flash_new
 
     if yarn is None:
         yarn = {}
-
+    
     if base_model is not None:
         model = base_model
     else:
         model = transformers.AutoModelForCausalLM.from_pretrained(
             model_name,
             attn_implementation="flash_attention_2",
-            dtype=torch.bfloat16,
+            torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             device_map="auto" if device is None else device,
             **yarn,
         )
 
     if _flash_new is not None:
-        # for some cases, i.e., Phi-3,
+        # for some cases, i.e., Phi3,
         # AutoModel load code from remote; hence the replacement is not done
-        # second try to replace forward method on existing instances
+        # second try to replace
         for layers in model.model.layers:
             if not hasattr(layers, "self_attn"):
                 continue
             _self_attn = layers.self_attn  # type: nn.Module
             if not isinstance(_self_attn, _flash_new):
-                # Bind our custom forward method to the existing attention instance
-                _self_attn.forward = _flash_new.forward.__get__(_self_attn)
+                _self_attn.forward = _flash_new.forward.__get__(
+                    layers.self_attn)
 
-    # Restore old class if we replaced it
-    if _mod_cls is not None and old_flash is not None:
-        _mod_cls["flash_attention_2"] = old_flash
+    _mod_cls["flash_attention_2"] = old_flash
 
     model = model.eval()
 
@@ -2603,7 +2728,7 @@ def load_model(
     else:
         model = transformers.AutoModelForCausalLM.from_pretrained(
             model_name,
-            dtype=torch.bfloat16,
+            torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             attn_implementation="flash_attention_2",
             device_map="auto" if device is None else device,

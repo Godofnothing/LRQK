@@ -1,8 +1,14 @@
 # Efficient Low Rank Attention for Long-Context Inference in Large Language Models
 
-![poster-60dpi](./poster/poster-dpi60-1.png)
 
 [Paper Link](https://arxiv.org/abs/2510.23649) | [NeurIPS Presentation](https://neurips.cc/virtual/2025/loc/san-diego/poster/118451) | [Project Poster](./poster/poster-dpi300-1.png)
+
+
+## Timeline
+
+- April 11, 2026: Support transformers: 5.3.0 
+  - Old version of lrqk_attention has been move to [lrqk_attention_transformers_4_47.py](./lrqk_attention_transformers_4_47.py)
+  - New version of lrqk_attention [lrqk_attention.py](./lrqk_attention.py)
 
 ## Overview
 
