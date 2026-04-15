@@ -21,6 +21,7 @@ from transformers.models.llama import modeling_llama
 from transformers.models.mistral import modeling_mistral
 from transformers.models.phi3 import modeling_phi3
 from transformers.models.qwen2 import modeling_qwen2
+from transformers.models.qwen3 import modeling_qwen3
 
 import cpp_kernel
 
@@ -1722,6 +1723,75 @@ class LRQK_Qwen2Attention(modeling_qwen2.Qwen2Attention):
         return attn_output, None
 
 
+class LRQK_Qwen3Attention(modeling_qwen3.Qwen3Attention):
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_value: Optional[cache_utils.Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(
+            bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(
+            bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(
+            bsz, q_len, -1, self.head_dim).transpose(1, 2)
+
+        # Qwen3-specific: per-head QK normalization applied before RoPE
+        query_states = self.q_norm(query_states)
+        key_states = self.k_norm(key_states)
+
+        cos, sin = position_embeddings
+        query_states, key_states = modeling_qwen3.apply_rotary_pos_emb(
+            query_states, key_states, cos, sin)
+
+        key_states, value_states = past_key_value.update(
+            query_states, key_states, value_states, self.layer_idx,
+            attention_mask=attention_mask)
+
+        input_dtype = query_states.dtype
+        if input_dtype == torch.float32:
+            if torch.is_autocast_enabled():
+                target_dtype = torch.get_autocast_gpu_dtype()
+            elif hasattr(self.config, "_pre_quantization_dtype"):
+                target_dtype = self.config._pre_quantization_dtype
+            else:
+                target_dtype = self.q_proj.weight.dtype
+
+            modeling_qwen3.logger.warning_once(
+                f"The input hidden states seems to be silently casted in float32, this might be related to"
+                f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
+                f" {target_dtype}."
+            )
+
+            query_states = query_states.to(target_dtype)
+            key_states = key_states.to(target_dtype)
+            value_states = value_states.to(target_dtype)
+
+        # flash_attn_with_kvcache expects (batch, seqlen, nheads, headdim)
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+        attn_output = flash_attn_with_kvcache(
+            query_states, key_states, value_states, causal=True)
+
+        attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, None
+
+
 class LRQK_LlamaAttention(modeling_llama.LlamaAttention):
 
     def forward(
@@ -1945,7 +2015,9 @@ def load_model_hack(
     mn = model_name.lower()
     _flash_new = None
 
-    if "qwen" in mn:
+    if "qwen3" in mn:
+        _flash_new = LRQK_Qwen3Attention
+    elif "qwen" in mn:
         _flash_new = LRQK_Qwen2Attention
     elif "llama" in mn:
         _flash_new = LRQK_LlamaAttention

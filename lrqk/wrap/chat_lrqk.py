@@ -15,7 +15,7 @@ import warnings
 
 from opencompass.registry import MODELS
 # from lrqk.wrap.registry_lrqk import LRQK_REGISTRY
-import lrqk_attention
+import lrqk_attention_transformers_4_52 as lrqk_attention
 import kvquant_lib as kvquant
 
 # from opencompass.models.base import BaseModel
