@@ -1367,7 +1367,7 @@ class DynamicLRQKCache(cache_utils.Cache):
     def __init__(
         self,
         r: int = 16,
-        num_active_tokens: int = 512,
+        num_active_tokens: Union[int, float] = 512,
         lambda_Q: float = 1.0,
         lambda_K: float = 1.0,
         max_iter: Union[int, tuple[int]] = 2,
@@ -1389,20 +1389,25 @@ class DynamicLRQKCache(cache_utils.Cache):
         self.max_iter = _ensure_tuple2(max_iter)
         self.tol = _ensure_tuple2(tol)
         self.lite_tokens = lite_tokens
+        self.max_sequence_length = max_sequence_length
+        self._lwattn_factory = lwattn_factory
+        self.init_aq_ak_method = init_aq_ak_method
 
-        self.lwattn = defaultdict(lambda: lwattn_factory(
-            num_lite_tokens=lite_tokens,
-            attn_topk=num_active_tokens,
-            num_key_value_groups=num_key_value_groups,
-            r=r,
-            max_iter=max_iter,
-            tol=tol,
-            capacity=max_sequence_length,
-            init_aq_ak_method=init_aq_ak_method,
+        # Lambdas read self.num_active_tokens at call-time so that a float
+        # ratio resolved during the first prefill is picked up correctly.
+        self.lwattn = defaultdict(lambda: self._lwattn_factory(
+            num_lite_tokens=self.lite_tokens,
+            attn_topk=self.num_active_tokens,
+            num_key_value_groups=self.num_key_value_groups,
+            r=self.r,
+            max_iter=self.max_iter,
+            tol=self.tol,
+            capacity=self.max_sequence_length,
+            init_aq_ak_method=self.init_aq_ak_method,
         ))
 
         self.temp_buff_cache_qkv = defaultdict(
-            lambda: _CacheQKV(num_active_tokens, 2))  # type: Dict[int, _CacheQKV]
+            lambda: _CacheQKV(self.num_active_tokens, 2))  # type: Dict[int, _CacheQKV]
 
         self.sequence_state = defaultdict(
             lambda: DynamicLRQKCache.State.pending)
@@ -1419,6 +1424,13 @@ class DynamicLRQKCache(cache_utils.Cache):
         return len(self.sequence_state)
 
     def get_seq_length(self, layer_idx=0):
+        # Avoid touching the defaultdict before the first update() call:
+        # HuggingFace calls get_seq_length() during generate() setup, and
+        # accessing self.lwattn[layer_idx] here would create the
+        # LightAttentionIndicesFactory with a still-float attn_topk,
+        # making gpu_capacity a float and breaking torch.zeros() in prefill.
+        if layer_idx not in self.lwattn:
+            return 0
         return len(self.lwattn[layer_idx])
 
     def get_max_cache_shape(self) -> Optional[int]:
@@ -1470,6 +1482,11 @@ class DynamicLRQKCache(cache_utils.Cache):
         # or a 4D causal mask. Only apply manual masking for 2D padding masks.
 
         if state == self.State.pending:
+            # Resolve a float ratio to a concrete token count using the
+            # current input length, mirroring the shadowkv pattern.
+            if isinstance(self.num_active_tokens, float):
+                self.num_active_tokens = max(1, int(self.num_active_tokens * seq_len))
+
             if attention_mask is not None and attention_mask.dim() == 2:
                 key_states = key_states.clone()
                 value_states = value_states.clone()

@@ -2,7 +2,7 @@
 Implementation of a chatbot for OpenCampas
 """
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import torch
 from opencompass.models.huggingface_above_v4_33 import (
@@ -27,7 +27,7 @@ class LRQKChatBot(HuggingFacewithChatTemplate):
         self, 
         path: str,
         lrqk_rank: int = 16,
-        lrqk_num_active_tokens: int = 1024,
+        lrqk_num_active_tokens: Union[int, float] = 1024,
         lrqk_lite_tokens: int = 64,
         lrqk_max_iter: int = 2,
         lrqk_tol: float = 1e-2,
